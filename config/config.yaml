@@ -30,7 +30,7 @@ plugins:
         class: "modules.llm.providers.qwen3_vl.Qwen3VLProvider"
         config:
           base_url: "${OLLAMA_BASE_URL}"
-          model: "${QWEN3_VL_MODEL}"
+          model: "qwen3-vl:8b"
 
 server:
   host: "0.0.0.0"

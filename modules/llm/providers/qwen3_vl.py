@@ -26,8 +26,8 @@ class Qwen3VLProvider(ILLMProvider):
     def initialize(self, config: Dict[str, Any]) -> None:
         self.config = config
         self.base_url = os.getenv('OLLAMA_BASE_URL', config.get('base_url'))
-        self.model = os.getenv('QWEN3_VL_MODEL', config.get('model'))
-        logger.info(f"Qwen3VL provider initialized: {self.base_url}")
+        self.model = os.getenv('QWEN3_VL_MODEL', config.get('model', 'qwen3-vl:8b'))
+        logger.info(f"Qwen3VL provider initialized: {self.base_url}, model: {self.model}")
     
     def cleanup(self) -> None:
         pass
@@ -82,33 +82,37 @@ class Qwen3VLProvider(ILLMProvider):
     
     def generate_with_image(self, prompt: str, image_path: str, **kwargs) -> LLMResponse:
         try:
+            if not os.path.exists(image_path):
+                raise FileNotFoundError(f"Image not found: {image_path}")
+            
             image_base64 = self._encode_image(image_path)
+            logger.info(f"Image encoded: {len(image_base64)} chars")
             
             payload = {
                 "model": self.model,
-                "messages": [
-                    {
-                        "role": "user",
-                        "content": prompt,
-                        "images": [image_base64]
-                    }
-                ],
+                "prompt": prompt,
+                "images": [image_base64],
                 "stream": False
             }
             
             if 'temperature' in kwargs:
                 payload['options'] = {'temperature': kwargs['temperature']}
             
+            logger.info(f"Calling Ollama: {self.base_url}/api/generate with {self.model}")
+            
             response = requests.post(
-                f"{self.base_url}/api/chat",
+                f"{self.base_url}/api/generate",
                 json=payload
             )
             response.raise_for_status()
             
             result = response.json()
+            response_text = result.get('response', '')
+            
+            logger.info(f"Ollama response length: {len(response_text)} chars")
             
             return LLMResponse(
-                text=result.get('message', {}).get('content', ''),
+                text=response_text,
                 tokens_used=result.get('eval_count', 0),
                 metadata={
                     'model': self.model,
