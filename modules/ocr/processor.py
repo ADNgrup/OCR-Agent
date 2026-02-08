@@ -74,14 +74,13 @@ class OCRProcessor:
         
         pipeline_steps.extend(['qwen3-vl-visual', 'glm-ocr'])
         
-        logger.info("Fast mode: Step 3 - Integration")
+        logger.info("Fast mode: Step 3 - Integration (text-only)")
         try:
-            final_response = self.llm_provider.integrate_results(
-                input_path,
+            final_response = self.llm_provider.integrate_results_text_only(
                 visual_response.text,
                 glm_result.text
             )
-            pipeline_steps.append('qwen3-vl-integration')
+            pipeline_steps.append('qwen3-vl-integration-text')
             ocr_text = final_response.text
             confidence = glm_result.confidence
         except Exception as e:

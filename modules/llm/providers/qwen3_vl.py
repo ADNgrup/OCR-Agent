@@ -163,6 +163,24 @@ Complete document with all visual and text data organized clearly. NO additional
         
         return self.generate_with_image(prompt, image_path, **kwargs)
     
+    def integrate_results_text_only(self, visual_elements: str, ocr_text: str, **kwargs) -> LLMResponse:
+        prompt = f"""Merge these two data sources into one markdown document:
+
+VISUAL ELEMENTS:
+{visual_elements}
+
+OCR TEXT:
+{ocr_text}
+
+FORMAT:
+- Use markdown headers (##, ###)
+- Use tables for structured data
+- Use bullets for lists
+- Combine and organize all information
+- NO analysis or commentary"""
+        
+        return self.generate(prompt, **kwargs)
+    
     def structure_blocks(self, image_path: str, blocks: list, **kwargs) -> LLMResponse:
         import json
         
