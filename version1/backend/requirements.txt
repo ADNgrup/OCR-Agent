@@ -1,0 +1,10 @@
+fastapi==0.116.1
+uvicorn[standard]==0.35.0
+pymongo==4.8.0
+python-dotenv==1.1.1
+requests==2.32.5
+pillow==11.3.0
+numpy==2.3.2
+openai
+#python -m pip install paddlepaddle==3.2.0 -i https://www.paddlepaddle.org.cn/packages/stable/cpu/
+#python -m pip install "paddleocr[all]"

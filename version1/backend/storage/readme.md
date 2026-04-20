@@ -1,0 +1,1 @@
+This forder is used to store tmp snapshot files and and something  else

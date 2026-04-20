@@ -1,0 +1,12 @@
+{
+  "_key": "system_settings",
+  "db_host": "172.16.125.200",
+  "db_port": 27017,
+  "db_name": "ipu-ocr",
+  "llm_base_api": "http://172.16.125.200:33040/v1",
+  "llm_model": "qwen35b",
+  "api_key": "qwen35b@",
+  "poll_interval": 300,
+  "created_at": "2026-04-18T15:39:22.503029+00:00",
+  "updated_at": "2026-04-20T05:07:55.676643+00:00"
+}
