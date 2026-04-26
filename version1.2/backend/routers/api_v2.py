@@ -8,6 +8,7 @@ from typing import Any
 from uuid import uuid4
 
 from bson import ObjectId
+from bson.binary import Binary
 from fastapi import APIRouter, BackgroundTasks, HTTPException, Query, Body, UploadFile, File, Form
 from fastapi.responses import FileResponse, Response
 from PIL import Image
@@ -227,17 +228,83 @@ def _group_segmentation_schema(group: dict) -> list[dict]:
     return _normalize_segment_identity(converted)
 
 
-def _screen_sample_payload(sample: dict) -> dict:
+def _latest_legacy_sample(group: dict) -> dict | None:
+    samples = list(group.get("samples") or [])
+    if not samples:
+        return None
+    return samples[-1]
+
+
+def _group_has_binary_sample(group: dict) -> bool:
+    return group.get("sample") is not None
+
+
+def _screen_sample_payload(group: dict) -> dict | None:
+    if _group_has_binary_sample(group):
+        sample_meta = group.get("sample_meta") if isinstance(group.get("sample_meta"), dict) else {}
+        group_id = group.get("_id")
+        image_url = f"/api/v2/screens/{str(group_id)}/sample-image" if group_id else None
+        return {
+            "id": str(sample_meta.get("id") or "sample"),
+            "filename": sample_meta.get("filename") or "sample.png",
+            "content_type": sample_meta.get("content_type") or "image/png",
+            "image_hash": sample_meta.get("image_hash"),
+            "image_base64": image_url,
+            "width": sample_meta.get("width"),
+            "height": sample_meta.get("height"),
+            "created_at": sample_meta.get("created_at") or group.get("created_at"),
+        }
+
+    legacy = _latest_legacy_sample(group)
+    if not legacy:
+        return None
+
     return {
-        "id": str(sample.get("id") or ""),
-        "filename": sample.get("filename"),
-        "content_type": sample.get("content_type"),
-        "image_hash": sample.get("image_hash"),
-        "image_base64": sample.get("image_base64"),
-        "width": sample.get("width"),
-        "height": sample.get("height"),
-        "created_at": sample.get("created_at"),
+        "id": str(legacy.get("id") or ""),
+        "filename": legacy.get("filename"),
+        "content_type": legacy.get("content_type"),
+        "image_hash": legacy.get("image_hash"),
+        "image_base64": legacy.get("image_base64"),
+        "width": legacy.get("width"),
+        "height": legacy.get("height"),
+        "created_at": legacy.get("created_at"),
     }
+
+
+def _sample_count(group: dict) -> int:
+    if _group_has_binary_sample(group):
+        return 1
+    return len(list(group.get("samples") or []))
+
+
+def _sample_image_url(group: dict) -> str | None:
+    payload = _screen_sample_payload(group)
+    if not payload:
+        return None
+    return payload.get("image_base64")
+
+
+def _decode_data_url_image(data_url: str) -> tuple[str, bytes] | None:
+    text = str(data_url or "")
+    if not text.startswith("data:"):
+        return None
+
+    comma_idx = text.find(",")
+    if comma_idx <= 5:
+        return None
+
+    header = text[:comma_idx]
+    payload = text[comma_idx + 1 :]
+    if ";base64" not in header:
+        return None
+
+    content_type = header[5:].split(";", 1)[0] or "image/png"
+    try:
+        raw = base64.b64decode(payload)
+    except Exception:
+        return None
+
+    return content_type, raw
 
 
 def _ensure_group_schema(db, group: dict) -> tuple[dict, list[dict]]:
@@ -267,8 +334,6 @@ def _ensure_group_schema(db, group: dict) -> tuple[dict, list[dict]]:
 
 
 def _screen_summary_payload(group: dict) -> dict:
-    samples = list(group.get("samples") or [])
-    latest_sample = samples[-1] if samples else {}
     schema_count = _schema_count(group)
     return {
         "id": str(group.get("_id")),
@@ -278,8 +343,8 @@ def _screen_summary_payload(group: dict) -> dict:
         "ignored": bool(group.get("ignored")),
         "schema_status": _schema_status(group),
         "entity_count": schema_count,
-        "sample_count": len(samples),
-        "sample_image_url": latest_sample.get("image_base64"),
+        "sample_count": _sample_count(group),
+        "sample_image_url": _sample_image_url(group),
         "classified_at": group.get("classified_at"),
         "updated_at": group.get("updated_at"),
     }
@@ -302,16 +367,13 @@ def _serialize_source(source: dict) -> dict:
 
 
 def _screen_library_payload(db, group: dict) -> dict:
-    samples = list(group.get("samples") or [])
-    latest_sample = samples[-1] if samples else {}
-
     result_query = {"screen_group_id": group.get("_id")}
     latest_result = db.ocr_results.find_one(result_query, sort=[("created_at", -1)]) if group.get("_id") else None
     latest_result = latest_result or {}
     snapshot_count = db.ocr_results.count_documents(result_query) if group.get("_id") else 0
 
     latest_snapshot_id = latest_result.get("snapshot_id")
-    sample_image_url = latest_sample.get("image_base64")
+    sample_image_url = _sample_image_url(group)
     if not sample_image_url and latest_snapshot_id:
         sample_image_url = f"/api/v2/snapshots/{str(latest_snapshot_id)}/image"
 
@@ -323,7 +385,7 @@ def _screen_library_payload(db, group: dict) -> dict:
         "ignored": bool(group.get("ignored")),
         "schema_status": _schema_status(group),
         "entity_count": _schema_count(group),
-        "sample_count": len(samples) if samples else snapshot_count,
+        "sample_count": _sample_count(group) or snapshot_count,
         "sample_image_url": sample_image_url,
         "snapshot_count": snapshot_count,
         "last_snapshot_at": latest_result.get("created_at"),
@@ -704,6 +766,33 @@ def get_snapshot_image_v2(snapshot_id: str):
     return FileResponse(image_path, media_type="image/png")
 
 
+@router.get("/screens/{screen_group_id}/sample-image")
+def get_screen_sample_image_v2(screen_group_id: str):
+    db = get_db()
+    try:
+        group = db.screen_groups.find_one({"_id": ObjectId(screen_group_id)})
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid screen id")
+
+    if not group:
+        raise HTTPException(status_code=404, detail="Screen group not found")
+
+    sample_binary = group.get("sample")
+    if sample_binary is not None:
+        sample_meta = group.get("sample_meta") if isinstance(group.get("sample_meta"), dict) else {}
+        media_type = str(sample_meta.get("content_type") or "image/png")
+        return Response(content=bytes(sample_binary), media_type=media_type)
+
+    legacy = _latest_legacy_sample(group)
+    if legacy and legacy.get("image_base64"):
+        decoded = _decode_data_url_image(str(legacy.get("image_base64") or ""))
+        if decoded:
+            media_type, raw = decoded
+            return Response(content=raw, media_type=media_type)
+
+    raise HTTPException(status_code=404, detail="Sample image not found")
+
+
 @router.get("/screens/{screen_group_id}/preview")
 def screen_preview_v2(screen_group_id: str):
     db = get_db()
@@ -727,13 +816,12 @@ def get_screen_schema_editor_v2(screen_group_id: str):
 
     group, segmentation_schema = _ensure_group_schema(db, group)
 
-    samples = list(group.get("samples") or [])
-    samples.sort(key=lambda item: item.get("created_at") or now_utc(), reverse=True)
+    sample_payload = _screen_sample_payload(group)
 
     return {
         **_screen_summary_payload(group),
         "segmentation_schema": segmentation_schema,
-        "samples": [_screen_sample_payload(smp) for smp in samples],
+        "samples": [sample_payload] if sample_payload else [],
     }
 
 
@@ -803,6 +891,7 @@ async def upload_screen_sample_v2(
     brightness = brightness_feature(image)
 
     group = None
+    created_group = False
     if screen_group_id:
         try:
             group_oid = ObjectId(screen_group_id)
@@ -811,7 +900,14 @@ async def upload_screen_sample_v2(
         group = db.screen_groups.find_one({"_id": group_oid})
         if not group:
             raise HTTPException(status_code=404, detail="Screen group not found")
+        if _group_has_binary_sample(group):
+            raise HTTPException(status_code=409, detail="This screen already has an initialized sample and cannot be updated")
+        legacy_samples = list(group.get("samples") or [])
+        if legacy_samples:
+            raise HTTPException(status_code=409, detail="This screen already has an initialized sample and cannot be updated")
     else:
+        sample_id = uuid4().hex[:12]
+        content_type = file.content_type or "image/png"
         group = {
             "source_id": source["_id"],
             "monitor_key": monitor_key or "default",
@@ -822,34 +918,45 @@ async def upload_screen_sample_v2(
                 "histogram": histogram,
                 "brightness": [brightness[0], brightness[1]],
             },
-            "samples": [],
+            "sample": Binary(content),
+            "sample_meta": {
+                "id": sample_id,
+                "filename": file.filename or f"sample_{sample_id}.png",
+                "content_type": content_type,
+                "image_hash": image_hash,
+                "width": int(image.width),
+                "height": int(image.height),
+                "created_at": now,
+            },
             "created_at": now,
             "updated_at": now,
         }
         inserted = db.screen_groups.insert_one(group)
         group["_id"] = inserted.inserted_id
+        created_group = True
 
     fingerprint = group.get("fingerprint") or {}
     updated_fp = average_fingerprint(fingerprint, histogram, brightness)
-    sample_id = uuid4().hex[:12]
-
-    content_type = file.content_type or "image/png"
-    image_base64 = f"data:{content_type};base64,{base64.b64encode(content).decode('ascii')}"
-    sample_doc = {
-        "id": sample_id,
-        "filename": file.filename or f"sample_{sample_id}.png",
-        "content_type": content_type,
-        "image_hash": image_hash,
-        "image_base64": image_base64,
-        "width": int(image.width),
-        "height": int(image.height),
-        "created_at": now,
-    }
 
     set_payload = {
         "fingerprint": updated_fp,
         "updated_at": now,
     }
+
+    if not created_group:
+        sample_id = uuid4().hex[:12]
+        content_type = file.content_type or "image/png"
+        set_payload["sample"] = Binary(content)
+        set_payload["sample_meta"] = {
+            "id": sample_id,
+            "filename": file.filename or f"sample_{sample_id}.png",
+            "content_type": content_type,
+            "image_hash": image_hash,
+            "width": int(image.width),
+            "height": int(image.height),
+            "created_at": now,
+        }
+
     if screen_name and str(screen_name).strip():
         set_payload["name"] = str(screen_name).strip()
     if monitor_key and str(monitor_key).strip():
@@ -859,12 +966,7 @@ async def upload_screen_sample_v2(
         {"_id": group["_id"]},
         {
             "$set": set_payload,
-            "$push": {
-                "samples": {
-                    "$each": [sample_doc],
-                    "$slice": -20,
-                }
-            },
+            "$unset": {"samples": ""},
         },
     )
 
@@ -875,7 +977,7 @@ async def upload_screen_sample_v2(
     return {
         "ok": True,
         "screen": _screen_summary_payload(refreshed or group),
-        "sample": _screen_sample_payload(sample_doc),
+        "sample": _screen_sample_payload(refreshed or group),
     }
 
 

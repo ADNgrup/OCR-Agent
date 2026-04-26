@@ -3,10 +3,8 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
 
 import SceneAndSchemaSection from "@/components/dashboard/SceneAndSchemaSection";
-import ScreenLibrarySection from "@/components/dashboard/ScreenLibrarySection";
 import TimeseriesLogsSection from "@/components/dashboard/TimeseriesLogsSection";
 import TopOverviewSection from "@/components/dashboard/TopOverviewSection";
-import { getScreenSchemaStatus } from "@/components/dashboard/dashboardUtils";
 import { DEFAULT_BACKEND } from "@/lib/api";
 import { useBackendApi } from "@/lib/hooks/useBackendApi";
 import {
@@ -38,6 +36,7 @@ export default function DashboardPage() {
   const [loading, setLoading] = useState(false);
   const [status, setStatus] = useState("Ready");
   const [error, setError] = useState("");
+  const [isGrafanaBlocked, setIsGrafanaBlocked] = useState(false);
 
   const [queueStats, setQueueStats] = useState<QueueStats>({
     pending: 0,
@@ -50,14 +49,8 @@ export default function DashboardPage() {
     () => screens.find((s) => s.id === screenId),
     [screens, screenId],
   );
-  const importedScreens = useMemo(
-    () => screens.filter((screen) => getScreenSchemaStatus(screen) === "classified"),
-    [screens],
-  );
-  const queuedScreens = useMemo(
-    () => screens.filter((screen) => getScreenSchemaStatus(screen) !== "classified"),
-    [screens],
-  );
+  const grafanaUrl =
+    "https://massiotmanager.grafana.net/public-dashboards/ca4bfe71305d4536a89fd77dab86c794?refresh=auto&kiosk";
 
   useEffect(() => {
     setSelectedEntityIds((prev) =>
@@ -367,13 +360,43 @@ export default function DashboardPage() {
         onMonitorSelected={onMonitorSelected}
       />
 
-      <ScreenLibrarySection
-        importedScreens={importedScreens}
-        queuedScreens={queuedScreens}
-        loading={loading}
-        onOpenScreen={onScreenChange}
-        onToggleScreenIgnore={toggleScreenIgnore}
-      />
+      <section className="card" style={{ marginTop: 24, padding: 16 }}>
+        <div
+          style={{
+            display: "flex",
+            justifyContent: "space-between",
+            alignItems: "center",
+            gap: 12,
+            marginBottom: 12,
+          }}
+        >
+          <h2 style={{ margin: 0 }}>Grafana Dashboard</h2>
+          <a
+            href={grafanaUrl}
+            target="_blank"
+            rel="noreferrer"
+            className="btn-sm btn-secondary"
+          >
+            Open in new tab
+          </a>
+        </div>
+        {isGrafanaBlocked ? (
+          <p className="muted" style={{ marginBottom: 0 }}>
+            This browser blocked embedding the Grafana dashboard. Use "Open in new tab" to view it directly.
+          </p>
+        ) : null}
+        <div style={{ height: 520, borderRadius: 10, overflow: "hidden" }}>
+          <iframe
+            src={grafanaUrl}
+            width="100%"
+            height="100%"
+            frameBorder="0"
+            title="Grafana Dashboard"
+            allow="autoplay; fullscreen"
+            onError={() => setIsGrafanaBlocked(true)}
+          ></iframe>
+        </div>
+      </section>
 
       <TimeseriesLogsSection series={series} logs={logs} />
     </main>

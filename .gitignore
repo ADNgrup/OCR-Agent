@@ -8,3 +8,4 @@
 *.png
 *.env
 *.rsync.sh
+*.Identifier

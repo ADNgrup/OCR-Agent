@@ -11,5 +11,6 @@ opencv-python-headless
 json_repair
 pandas
 python-multipart
+influxdb3-python
 #python -m pip install paddlepaddle==3.2.0 -i https://www.paddlepaddle.org.cn/packages/stable/cpu/
 #python -m pip install "paddleocr[all]"

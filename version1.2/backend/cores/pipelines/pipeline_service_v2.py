@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import asyncio
-import base64
 import difflib
 import hashlib
 import io
@@ -55,12 +54,153 @@ class PipelineServiceV2(pipeline_service.PipelineService):
        - matched + schema: OCR by segmentation.
        - matched + no schema: ignore.
        - no match: queue as new sample and ignore.
-    3. Save OCR result to `ocr_entities` using a fresh DB client connection.
+    3. Save OCR result to `ocr_results` and push to external dashboard.
     """
 
     def __init__(self):
         super().__init__()
         self.normalizer = pipeline_utils.EntityExtractionNormalizer()
+        self._dashboard_insert_fn = None
+        self._dashboard_insert_import_attempted = False
+
+    def _get_dashboard_insert_fn(self):
+        if self._dashboard_insert_import_attempted:
+            return self._dashboard_insert_fn
+
+        self._dashboard_insert_import_attempted = True
+        try:
+            from push_to_gafana import insert_ocr_result as insert_fn
+            self._dashboard_insert_fn = insert_fn
+        except Exception as exc:
+            self._dashboard_insert_fn = None
+            logger.warning("Dashboard push integration is unavailable: %s", exc)
+        return self._dashboard_insert_fn
+
+    @staticmethod
+    def _normalize_area_token(value: Any) -> str:
+        text = str(value or "").strip()
+        if not text:
+            return "unknown"
+        text = re.sub(r"\s+", "", text)
+        text = text.replace("/", "_")
+        return text
+
+    def _iter_dashboard_payload_rows(self, source: dict, snapshot: dict, entities: list[dict[str, Any]]):
+        kvm_port = source.get("port")
+        if kvm_port is None or str(kvm_port).strip() == "":
+            kvm_port = "unknown"
+
+        screen_group_id = snapshot.get("screen_group_id")
+        if screen_group_id is None:
+            screen_group_id = "unknown"
+
+        screen_id = f"{self._normalize_area_token(kvm_port)}_{self.to_id(screen_group_id)}"
+
+        for ent in entities or []:
+            if not isinstance(ent, dict):
+                continue
+
+            seg_id_raw = ent.get("segment_id") or ent.get("id") or "Segment"
+            seg_id = self._normalize_area_token(seg_id_raw)
+            seg_type = self._normalize_object_type(ent.get("type"))
+            value = ent.get("value") if isinstance(ent.get("value"), dict) else {}
+
+            if seg_type == "log tables":
+                logs = value.get("logs") if isinstance(value.get("logs"), list) else []
+                if not logs:
+                    logs = ent.get("logs") if isinstance(ent.get("logs"), list) else []
+
+                if not logs:
+                    raw_csv = str(value.get("raw_csv_table") or ent.get("raw_csv_table") or "").strip()
+                    if raw_csv:
+                        try:
+                            import csv
+                            rows = list(csv.reader(io.StringIO(raw_csv)))
+                            if rows:
+                                header = [str(col).strip().lower() for col in rows[0]]
+                                msg_idx = header.index("message") if "message" in header else (1 if len(header) > 1 else 0)
+                                for row in rows[1:]:
+                                    message_text = str(row[msg_idx]).strip() if msg_idx < len(row) else ""
+                                    if message_text:
+                                        logs.append({"message": message_text})
+                        except Exception:
+                            pass
+
+                area_id = f"{seg_id}_message"
+                for lg in logs:
+                    if not isinstance(lg, dict):
+                        continue
+                    msg = str(lg.get("message") or lg.get("desc") or lg.get("msg") or lg.get("name") or "").strip()
+                    if not msg:
+                        continue
+                    yield screen_id, area_id, "text", msg
+                continue
+
+            fallback_columns = [str(col).strip() for col in (ent.get("columns") or []) if str(col).strip()]
+            fallback_rows = [str(row).strip() for row in (ent.get("rows") or []) if str(row).strip()]
+            if seg_type != "fixed table" and not fallback_rows:
+                fallback_rows = ["value"]
+
+            _, _, sub_rows = self._expand_table_value(
+                value,
+                fallback_columns=fallback_columns,
+                fallback_rows=fallback_rows,
+            )
+
+            if not sub_rows and isinstance(ent.get("subentities"), list):
+                sub_rows = self._normalize_table_subentities(
+                    ent.get("subentities") or [],
+                    columns=fallback_columns or None,
+                    rows=fallback_rows or None,
+                )
+
+            for sub in sub_rows:
+                if not isinstance(sub, dict):
+                    continue
+
+                raw_value = sub.get("value_raw", sub.get("value"))
+                explicit_number = sub.get("value_number")
+                if raw_value is None and explicit_number is None:
+                    continue
+                if isinstance(raw_value, str) and raw_value.strip() == "" and explicit_number is None:
+                    continue
+
+                col_name = self._normalize_area_token(sub.get("col"))
+                row_name = self._normalize_area_token(sub.get("row") or "value")
+                if col_name == "unknown":
+                    continue
+
+                number, _ = self._coerce_numeric_pair(
+                    raw_value,
+                    explicit_number,
+                )
+
+                if seg_type == "scada object":
+                    area_id = f"{seg_id}_{col_name}"
+                else:
+                    area_id = f"{seg_id}_{row_name}_{col_name}"
+
+                yield screen_id, area_id, "number", str(number)
+
+    def _push_ocr_result_to_dashboard(self, source: dict, snapshot: dict, entities: list[dict[str, Any]]) -> None:
+        insert_fn = self._get_dashboard_insert_fn()
+        if insert_fn is None:
+            return
+
+        for screen_id, area_id, type_value, ocr_value in self._iter_dashboard_payload_rows(source, snapshot, entities):
+            if ocr_value is None:
+                continue
+            if isinstance(ocr_value, str) and ocr_value.strip() == "":
+                continue
+            try:
+                insert_fn(screen_id, area_id, type_value, ocr_value)
+            except Exception as exc:
+                logger.warning(
+                    "Dashboard push failed (screen_id=%s, area_id=%s): %s",
+                    screen_id,
+                    area_id,
+                    exc,
+                )
 
     @staticmethod
     def _clamp_pct(value: Any, default: float = 0.0) -> float:
@@ -167,27 +307,6 @@ class PipelineServiceV2(pipeline_service.PipelineService):
 
         return normalized
 
-    def _build_sample_doc(
-        self,
-        image_bytes: bytes,
-        image_hash: str,
-        image: Image.Image,
-        monitor_key: str,
-    ) -> dict[str, Any]:
-        sample_id = uuid4().hex[:12]
-        content_type = "image/png"
-        image_base64 = f"data:{content_type};base64,{base64.b64encode(image_bytes).decode('ascii')}"
-        return {
-            "id": sample_id,
-            "filename": f"sample_{monitor_key}_{sample_id}.png",
-            "content_type": content_type,
-            "image_hash": image_hash,
-            "image_base64": image_base64,
-            "width": int(image.width),
-            "height": int(image.height),
-            "created_at": now_utc(),
-        }
-
     def _find_best_group_match(
         self,
         db: Database,
@@ -226,7 +345,6 @@ class PipelineServiceV2(pipeline_service.PipelineService):
         self,
         db: Database,
         group: dict,
-        sample_doc: dict,
         histogram: list[float],
         brightness: tuple[float, float],
     ) -> dict:
@@ -234,8 +352,10 @@ class PipelineServiceV2(pipeline_service.PipelineService):
         db.screen_groups.update_one(
             {"_id": group["_id"]},
             {
-                "$set": {"fingerprint": updated_fp, "updated_at": now_utc()},
-                "$push": {"samples": {"$each": [sample_doc], "$slice": -20}},
+                "$set": {
+                    "fingerprint": updated_fp,
+                    "updated_at": now_utc(),
+                },
             },
         )
         return db.screen_groups.find_one({"_id": group["_id"]}) or group
@@ -245,7 +365,6 @@ class PipelineServiceV2(pipeline_service.PipelineService):
         db: Database,
         source: dict,
         monitor_key: str,
-        sample_doc: dict,
         histogram: list[float],
         brightness: tuple[float, float],
     ) -> dict:
@@ -256,7 +375,6 @@ class PipelineServiceV2(pipeline_service.PipelineService):
             "name": f"queued_{monitor_key}_{int(now.timestamp())}",
             "schema_status": "unclassified",
             "segmentation_schema": [],
-            "samples": [sample_doc],
             "queue_status": "pending_schema",
             "fingerprint": {"histogram": histogram, "brightness": [brightness[0], brightness[1]]},
             "created_at": now,
@@ -289,6 +407,7 @@ class PipelineServiceV2(pipeline_service.PipelineService):
         saved_path: Path,
     ) -> dict:
         snapshot = {
+            "screen_group_id": group.get("_id"),
             "content_type": "image/png",
             "image_bytes": Binary(image_bytes),
             "created_at": now_utc(),
@@ -927,14 +1046,12 @@ class PipelineServiceV2(pipeline_service.PipelineService):
             matched_group = result["matched_group"]
 
             saved_path = self.save_snapshot(image_bytes, self.to_id(source["_id"]), monitor_key)
-            sample_doc = self._build_sample_doc(image_bytes, image_hash, image, monitor_key)
 
             if not matched_group:
                 queued_group = self._queue_new_unclassified_group(
                     db=db,
                     source=source,
                     monitor_key=monitor_key,
-                    sample_doc=sample_doc,
                     histogram=histogram,
                     brightness=brightness,
                 )
@@ -967,7 +1084,6 @@ class PipelineServiceV2(pipeline_service.PipelineService):
             group = self._append_sample_to_group(
                 db=db,
                 group=matched_group,
-                sample_doc=sample_doc,
                 histogram=histogram,
                 brightness=brightness,
             )
@@ -1737,6 +1853,7 @@ class PipelineServiceV2(pipeline_service.PipelineService):
             processing_time_ms=processing_time_ms,
             status="completed",
         )
+        self._push_ocr_result_to_dashboard(source=source, snapshot=snapshot, entities=entities)
 
     def _segment_schema_from_group(self, group: dict) -> list[dict]:
         segmentation = [dict(seg) for seg in (group.get("segmentation_schema") or []) if isinstance(seg, dict)]

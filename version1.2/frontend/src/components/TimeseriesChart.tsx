@@ -81,8 +81,8 @@ export default function TimeseriesChart({ series }: TimeseriesChartProps) {
   }
 
   return (
-    <div className="w-full min-h-[360px]">
-      <ResponsiveContainer width="100%" height={360}>
+    <div className="w-full min-h-[240px]">
+      <ResponsiveContainer width="100%" height={240}>
         <LineChart
           data={data}
           margin={{ top: 10, right: 24, bottom: 10, left: 0 }}
