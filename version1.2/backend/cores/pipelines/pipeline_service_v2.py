@@ -32,7 +32,12 @@ from cores.schema_mongo import MONGO_URI
 from utils.common import classify_value_type, clean_numeric_value, now_utc, _BOOL_TRUE_VALUES, _BOOL_FALSE_VALUES
 from utils.image_features import average_fingerprint, brightness_feature, histogram_feature, similarity_score, autocrop_image
 from utils.kvm_client import fetch_snapshot_bytes
-from cores.services.llm_client import call_llm_image_to_markdown, call_llm_markdown_to_json, ensure_llm_name
+from cores.services.llm_client import (
+    call_llm_image_to_markdown,
+    call_llm_markdown_to_json,
+    call_llm_segment,
+    ensure_llm_name,
+)
 from cores.services.llm_client import call_llm_v2_extract
 from cores.services import ocr
 from . import pipeline_service, pipeline_utils, per_write_detector
@@ -435,57 +440,6 @@ class PipelineServiceV2(pipeline_service.PipelineService):
         cropped.save(buffer, format="PNG")
         return buffer.getvalue()
 
-    def _build_segment_schema(self, segment: dict) -> tuple[dict[str, Any], str, list[str], list[str]]:
-        seg_type = self._normalize_object_type(segment.get("type"))
-        seg_name = str(segment.get("name") or "").strip() or "Unnamed"
-        columns = self._normalize_list(segment.get("columns"))
-        rows = self._normalize_list(segment.get("rows"))
-
-        if seg_type == "log tables":
-            columns = ["time", "message"]
-            entity = {
-                "main_entity_name": seg_name,
-                "type": "log/alert",
-                "region": "center",
-                "raw_csv_table": "time,message",
-                "metadata": {"value_columns": columns},
-            }
-        elif seg_type == "fixed table":
-            entity = {
-                "main_entity_name": seg_name,
-                "type": "table",
-                "region": "center",
-                "metadata": {
-                    "value_columns": columns,
-                    "rows": rows,
-                    "unit": "|".join(["" for _ in columns]),
-                    "value_type": "|".join(["number" for _ in columns]),
-                },
-                "raw_csv_table": "",
-            }
-        else:
-            if not columns:
-                columns = [self.normalizer.slugify(seg_name) or "value"]
-            indicators = [
-                {
-                    "label": col,
-                    "value_type": "number",
-                    "unit": "",
-                    "value_raw": "0",
-                    "value_number": 0,
-                }
-                for col in columns
-            ]
-            entity = {
-                "main_entity_name": seg_name,
-                "type": "HMI Object",
-                "region": "center",
-                "indicators": indicators,
-            }
-
-        schema = {"screen_title": seg_name, "entity_count": 1, "entities": [entity]}
-        return schema, seg_type, columns, rows
-
     @staticmethod
     def _normalize_numeric_scalar(value: Any) -> int | float | None:
         if value is None:
@@ -740,7 +694,7 @@ class PipelineServiceV2(pipeline_service.PipelineService):
         metadata = self._table_metadata(col_names, row_names, unit_by_col=unit_by_col)
         csv_text = str(raw_csv_table or "").strip()
         if not csv_text and normalized_subs:
-            csv_text = self._build_table_csv_from_subentities(normalized_subs, col_names)
+            csv_text = self._convert_entities_to_csv(normalized_subs, col_names)
 
         return {
             "storage": "table_v2",
@@ -824,30 +778,26 @@ class PipelineServiceV2(pipeline_service.PipelineService):
 
     def _extract_segment_with_llm(self, image: Image.Image, segment: dict) -> dict[str, Any]:
         bbox = self._normalize_bbox(segment.get("bbox"))
-        schema, seg_type, columns, rows = self._build_segment_schema(segment)
-        schema_str = json.dumps(schema, ensure_ascii=False, indent=2)
-        first_entity: dict[str, Any] = {}
+        seg_type = self._normalize_object_type(segment.get("type"))
+        columns = self._normalize_list(segment.get("columns"))
+        rows = self._normalize_list(segment.get("rows"))
+        
         parse_error: str | None = None
-
+        llm_out: dict[str, Any] = {}
+        
         try:
             crop_bytes = self._crop_segment_bytes(image, bbox)
-            llm_out = call_llm_markdown_to_json(
-                "",
+            llm_out = call_llm_segment(
                 image_bytes=crop_bytes,
-                promptype="v2_extract_base_prompt",
-                schema_str=schema_str,
+                seg_type=seg_type,
+                columns=columns,
+                rows=rows,
             )
-            if not isinstance(llm_out, dict):
-                parse_error = "invalid_llm_output"
-            else:
-                entities = llm_out.get("entities") or []
-                first_entity = entities[0] if entities else {}
-                parse_error = llm_out.get("_parse_error")
+            parse_error = llm_out.get("_parse_error")
         except Exception as exc:
-            # Segment-level guard: one failed crop/LLM call should not fail the whole snapshot.
             parse_error = f"llm_exception: {exc}"
 
-        value = self._build_segment_value(seg_type, columns, rows, first_entity)
+        value = self._build_segment_value(seg_type, columns, rows, llm_out)
 
         return {
             "segment_id": str(segment.get("id") or uuid4().hex[:8]),
@@ -857,57 +807,69 @@ class PipelineServiceV2(pipeline_service.PipelineService):
             "columns": columns,
             "rows": rows,
             "value": value,
-            "raw_llm_entity": first_entity,
+            "raw_llm_entity": llm_out,
             "llm_parse_error": parse_error,
         }
 
     def _build_segment_value(self, seg_type: str, columns: list[str], rows: list[str], first_entity: dict[str, Any]) -> dict[str, Any]:
+        raw_csv_table = str(first_entity.get("raw_csv_table") or "").strip()
+        
         if seg_type == "log tables":
+            # For log tables, we parse the CSV to a list of log objects for internal processing
+            logs = []
+            if raw_csv_table:
+                try:
+                    import io, csv
+                    reader = csv.DictReader(io.StringIO(raw_csv_table))
+                    for row_item in reader:
+                        logs.append({
+                            "time": row_item.get("time", ""),
+                            "message": row_item.get("message", "")
+                        })
+                except Exception as exc:
+                    logger.error("Failed to parse log CSV: %s", exc)
+
+            compact_table_value = self._convert_entities_to_csv(logs, ["time", "message"])
             return {
                 "columns": ["time", "message"],
-                "logs": first_entity.get("logs") or [],
-                "raw_csv_table": first_entity.get("raw_csv_table") or "",
+                "logs": logs,
+                "raw_csv_table": compact_table_value,
             }
+
         if seg_type == "fixed table":
-            raw_csv_table = str(first_entity.get("raw_csv_table") or "").strip()
             metadata = self._table_metadata(columns, rows)
-
             parsed_from_csv = self._parse_table_csv_to_subentities(raw_csv_table, metadata) if raw_csv_table else []
-            if parsed_from_csv:
-                normalized_subs = self._normalize_table_subentities(parsed_from_csv, columns=columns, rows=rows)
-            else:
-                subentities_raw = first_entity.get("subentities") or []
-                normalized_subs = self._normalize_table_subentities(subentities_raw, columns=columns, rows=rows)
-
+            normalized_subs = self._normalize_table_subentities(parsed_from_csv, columns=columns, rows=rows)
+            
+            compact_table_value = self._convert_entities_to_csv(normalized_subs, columns)
             return self._compact_table_value(
                 columns=columns,
                 rows=rows,
                 subentities=normalized_subs,
-                raw_csv_table=raw_csv_table,
+                raw_csv_table=compact_table_value,
             )
 
-        normalized_indicators = self._normalize_indicator_values(
-            first_entity.get("indicators") or [],
-            expected_labels=columns,
-        )
-        scada_rows = ["value"]
-        scada_subentities = [
-            {
-                "col": str(ind.get("label") or "").strip(),
-                "row": "value",
-                "value_raw": ind.get("value_raw"),
-                "value_number": ind.get("value_number"),
-                "unit": ind.get("unit") or "",
+        # SCADA Object: handle as a 2-column CSV (label, value)
+        metadata = self._table_metadata(columns=["value"], rows=columns)
+        parsed_from_csv = self._parse_table_csv_to_subentities(raw_csv_table, metadata) if raw_csv_table else []
+        
+        scada_subentities = []
+        for sub in parsed_from_csv:
+            scada_subentities.append({
+                "col": "value",
+                "row": sub.get("row"),
+                "value_raw": sub.get("value_raw"),
+                "value_number": sub.get("value_number"),
+                "unit": "",
                 "value_type": "number",
-            }
-            for ind in normalized_indicators
-            if str(ind.get("label") or "").strip()
-        ]
+            })
+
+        compact_table_value = self._convert_entities_to_csv(scada_subentities, ["value"])
         return self._compact_table_value(
-            columns=columns,
-            rows=scada_rows,
+            columns=["value"],
+            rows=columns,
             subentities=scada_subentities,
-            raw_csv_table="",
+            raw_csv_table=compact_table_value,
         )
 
     def _ensure_segment_schema(self, db: Database, group: dict) -> list[dict]:
@@ -1028,6 +990,101 @@ class PipelineServiceV2(pipeline_service.PipelineService):
             "match_score": match_score,
         }
 
+    @staticmethod
+    def _processing_time_ms(start_time: float) -> int:
+        return int((time.time() - start_time) * 1000)
+
+    def _store_empty_result_and_complete(
+        self,
+        db: Database,
+        source: dict,
+        group: dict,
+        snapshot: dict,
+        monitor_key: str,
+        image_hash: str,
+        start_time: float,
+        status: str,
+        completion_message: str,
+        job_id: Any,
+    ) -> None:
+        self._store_ocr_result(
+            db=db,
+            source=source,
+            group=group,
+            snapshot=snapshot,
+            monitor_key=monitor_key,
+            image_hash=image_hash,
+            entities=[],
+            llm_parse_error=None,
+            processing_time_ms=self._processing_time_ms(start_time),
+            status=status,
+        )
+        self.update_job(db, job_id, "completed", completion_message)
+
+    def _extract_segment_entities(
+        self,
+        image: Image.Image,
+        segments: list[dict[str, Any]],
+    ) -> tuple[list[dict[str, Any]], str | None]:
+        entities: list[dict[str, Any]] = []
+        parse_errors: list[str] = []
+
+        for seg in segments:
+            if not isinstance(seg, dict):
+                continue
+            segment_result = self._extract_segment_with_llm(image, seg)
+            entities.append(segment_result)
+            if segment_result.get("llm_parse_error"):
+                parse_errors.append(
+                    f"{segment_result.get('segment_id')}: {segment_result.get('llm_parse_error')}"
+                )
+
+        return entities, (" | ".join(parse_errors) if parse_errors else None)
+
+    def _queue_unmatched_snapshot_result(
+        self,
+        db: Database,
+        source: dict,
+        monitor_key: str,
+        histogram: list[float],
+        brightness: tuple[float, float],
+        image_bytes: bytes,
+        image_hash: str,
+        saved_path: Path,
+        start_time: float,
+        job_id: Any,
+    ) -> None:
+        queued_group = self._queue_new_unclassified_group(
+            db=db,
+            source=source,
+            monitor_key=monitor_key,
+            histogram=histogram,
+            brightness=brightness,
+        )
+        snapshot = self._insert_snapshot(
+            db=db,
+            source=source,
+            group=queued_group,
+            monitor_key=monitor_key,
+            image_bytes=image_bytes,
+            image_hash=image_hash,
+            histogram=histogram,
+            brightness=brightness,
+            saved_path=saved_path,
+        )
+        self._store_empty_result_and_complete(
+            db=db,
+            source=source,
+            group=queued_group,
+            snapshot=snapshot,
+            monitor_key=monitor_key,
+            image_hash=image_hash,
+            start_time=start_time,
+            status="queued_new_screen_group",
+            completion_message="New sample queued for schema",
+            job_id=job_id,
+        )
+
     def process_single_snapshot(self, db: Database, source: dict, monitor_key: str):
         start_time = time.time()
         logger.info("Processing snapshot V2 for source=%s monitor=%s", source.get("name"), monitor_key)
@@ -1048,45 +1105,28 @@ class PipelineServiceV2(pipeline_service.PipelineService):
             saved_path = self.save_snapshot(image_bytes, self.to_id(source["_id"]), monitor_key)
 
             if not matched_group:
-                queued_group = self._queue_new_unclassified_group(
+                self._queue_unmatched_snapshot_result(
                     db=db,
                     source=source,
                     monitor_key=monitor_key,
                     histogram=histogram,
                     brightness=brightness,
-                )
-                snapshot = self._insert_snapshot(
-                    db=db,
-                    source=source,
-                    group=queued_group,
-                    monitor_key=monitor_key,
                     image_bytes=image_bytes,
                     image_hash=image_hash,
-                    histogram=histogram,
-                    brightness=brightness,
                     saved_path=saved_path,
+                    start_time=start_time,
+                    job_id=job_id,
                 )
-                self._store_ocr_result(
-                    db=db,
-                    source=source,
-                    group=queued_group,
-                    snapshot=snapshot,
-                    monitor_key=monitor_key,
-                    image_hash=image_hash,
-                    entities=[],
-                    llm_parse_error=None,
-                    processing_time_ms=int((time.time() - start_time) * 1000),
-                    status="queued_new_screen_group",
-                )
-                self.update_job(db, job_id, "completed", "New sample queued for schema")
                 return
 
+            # update fingerprint of matched group with new sample
             group = self._append_sample_to_group(
                 db=db,
                 group=matched_group,
                 histogram=histogram,
                 brightness=brightness,
             )
+            # insert snapshot linked to matched group for ocr result checking
             snapshot = self._insert_snapshot(
                 db=db,
                 source=source,
@@ -1098,51 +1138,24 @@ class PipelineServiceV2(pipeline_service.PipelineService):
                 brightness=brightness,
                 saved_path=saved_path,
             )
-
-            if group.get("ignored"):
-                self._store_ocr_result(
-                    db=db,
-                    source=source,
-                    group=group,
-                    snapshot=snapshot,
-                    monitor_key=monitor_key,
-                    image_hash=image_hash,
-                    entities=[],
-                    llm_parse_error=None,
-                    processing_time_ms=int((time.time() - start_time) * 1000),
-                    status="ignored",
-                )
-                self.update_job(db, job_id, "completed", "Screen ignored")
-                return
-
-            segments = self._ensure_segment_schema(db, group)
+            segments = []
+            if not group.get("ignored"): segments = self._ensure_segment_schema(db, group)
             if not segments:
-                self._store_ocr_result(
+                self._store_empty_result_and_complete(
                     db=db,
                     source=source,
                     group=group,
                     snapshot=snapshot,
                     monitor_key=monitor_key,
                     image_hash=image_hash,
-                    entities=[],
-                    llm_parse_error=None,
-                    processing_time_ms=int((time.time() - start_time) * 1000),
-                    status="missing_schema",
+                    start_time=start_time,
+                    status="ignored",
+                    completion_message="Matched sample has no schema",
+                    job_id=job_id,
                 )
-                self.update_job(db, job_id, "completed", "Matched sample has no schema")
                 return
 
-            entities = []
-            parse_errors = []
-            for seg in segments:
-                if not isinstance(seg, dict):
-                    continue
-                segment_result = self._extract_segment_with_llm(image, seg)
-                entities.append(segment_result)
-                if segment_result.get("llm_parse_error"):
-                    parse_errors.append(f"{segment_result.get('segment_id')}: {segment_result.get('llm_parse_error')}")
-
-            llm_parse_error = " | ".join(parse_errors) if parse_errors else None
+            entities, llm_parse_error = self._extract_segment_entities(image, segments)
             self._finalize_snapshot(
                 db=db,
                 source=source,
@@ -1162,71 +1175,6 @@ class PipelineServiceV2(pipeline_service.PipelineService):
             logger.error("Snapshot failed: %s/%s: %s", source.get("name"), monitor_key, exc)
             raise
 
-    def _build_schema_prompt(self, group: dict, existing_schema: list) -> str | None:
-        if existing_schema:
-            runtime_entities = []
-            for ent in existing_schema:
-                ent_type = str(ent.get("type", "HMI Object")).strip()
-                ent_meta = ent.get("metadata", {}) if isinstance(ent.get("metadata"), dict) else {}
-                payload = {
-                    "id": ent.get("id"),
-                    "main_entity_name": ent.get("main_entity_name", ""),
-                    "type": ent_type,
-                    "region": ent.get("region", "center"),
-                }
-                ent_type_lower = ent_type.lower()
-
-                if ent_type_lower == "table":
-                    metadata = ent_meta
-                    value_columns = [str(col).strip() for col in metadata.get("value_columns", []) if str(col).strip()]
-                    if not value_columns:
-                        value_columns = []
-                        for sub in ent.get("subentities", []) or []:
-                            col = str(sub.get("col", "")).strip()
-                            if col and col not in value_columns:
-                                value_columns.append(col)
-                    payload["metadata"] = {
-                        "value_columns": value_columns,
-                        "unit": metadata.get("unit", ""),
-                        "value_type": "|".join(["number" for _ in value_columns]) if value_columns else "",
-                    }
-                    if "bbox" in metadata and isinstance(metadata.get("bbox"), dict):
-                        payload["metadata"]["bbox"] = metadata.get("bbox")
-                    payload["raw_csv_table"] = ""
-                elif ent_type_lower in ["log/alert", "log"]:
-                    if ent_meta:
-                        payload["metadata"] = ent_meta
-                    payload["raw_csv_table"] = "time,message"
-                else:
-                    if ent_meta:
-                        payload["metadata"] = ent_meta
-                    indicators = []
-                    for ind in ent.get("indicators", []) or []:
-                        label = str(ind.get("label") or ind.get("metric") or "").strip()
-                        if not label:
-                            continue
-                        indicators.append({
-                            "label": label,
-                            "value_type": "number",
-                            "unit": ind.get("unit", ""),
-                            "value_raw": "0",
-                            "value_number": 0,
-                        })
-                    payload["indicators"] = indicators
-
-                runtime_entities.append(payload)
-
-            full_schema = {
-                "screen_title": group.get("name", ""),
-                "entity_count": len(runtime_entities),
-                "entities": runtime_entities
-            }
-            import json
-            schema_str = json.dumps(full_schema, ensure_ascii=False, indent=2)
-            logger.info("Using existing schema definition for LLM extraction.")
-            return schema_str
-        return None
-
     def _generate_layout_text(self, saved_path: Path) -> str:
         try:
             return ocr.generate_layout_text(str(saved_path))
@@ -1234,202 +1182,45 @@ class PipelineServiceV2(pipeline_service.PipelineService):
             logger.warning("Failed to generate OCR layout text: %s", exc)
             return ""
 
-    def _extract_information(
-        self,
-        image_bytes: bytes,
-        layout_text: str,
-        schema_str: str | None,
-        schema_bootstrap: bool = False,
-    ) -> dict:
-        return call_llm_v2_extract(
-            image_bytes=image_bytes,
-            layout_text=layout_text,
-            schema_str=schema_str,
-            schema_bootstrap=schema_bootstrap,
-        )
-
-    def _bootstrap_schema(self, db: Database, group: dict, image_bytes: bytes, layout_text: str) -> list:
-        logger.info("No schema found for screen_group_id=%s. Bootstrapping schema first.", group.get("_id"))
-        bootstrap_json = self._extract_information(
-            image_bytes=image_bytes,
-            layout_text=layout_text,
-            schema_str=None,
-            schema_bootstrap=True,
-        )
-        bootstrap_entities = bootstrap_json.get("entities") or [] if isinstance(bootstrap_json, dict) else []
-        bootstrap_entities = self._post_process_tables(bootstrap_entities)
-        if not bootstrap_entities:
-            logger.warning("Schema bootstrap returned no entities for screen_group_id=%s", group.get("_id"))
-            return []
-        return self._update_schema(db, group, bootstrap_entities)
-
     def _entity_key(self, value: Any) -> str:
         text = str(value or "").strip()
         if not text:
             return ""
         return self.normalizer.slugify(text) or text.lower()
 
-    def _table_value_columns(self, entity: dict) -> list[str]:
-        metadata = entity.get("metadata", {}) if isinstance(entity.get("metadata"), dict) else {}
-        value_columns = metadata.get("value_columns", []) if isinstance(metadata, dict) else []
-        cols = [str(col).strip() for col in value_columns if str(col).strip()]
-        if cols:
-            return cols
-
-        cols = []
-        for sub in entity.get("subentities", []) or []:
-            col = str(sub.get("col", "")).strip()
-            if col and col not in cols:
-                cols.append(col)
-        return cols
-
-    def _entity_match_score(self, schema_ent: dict, candidate: dict) -> int:
-        schema_type = str(schema_ent.get("type", "HMI Object")).strip().lower()
-        cand_type = str(candidate.get("type", "HMI Object")).strip().lower()
-        if schema_type != cand_type:
-            return -1
-
-        score = 0
-        schema_name = self._entity_key(schema_ent.get("main_entity_name", ""))
-        cand_name = self._entity_key(candidate.get("main_entity_name", ""))
-        if schema_name and cand_name:
-            if schema_name == cand_name:
-                score += 100
-            elif schema_name in cand_name or cand_name in schema_name:
-                score += 40
-
-        if schema_type == "hmi object":
-            schema_terms = {
-                self._entity_key(ind.get("label") or ind.get("metric", ""))
-                for ind in (schema_ent.get("indicators", []) or [])
-                if self._entity_key(ind.get("label") or ind.get("metric", ""))
-            }
-            cand_terms = {
-                self._entity_key(ind.get("label") or ind.get("metric", ""))
-                for ind in (candidate.get("indicators", []) or [])
-                if self._entity_key(ind.get("label") or ind.get("metric", ""))
-            }
-            score += len(schema_terms.intersection(cand_terms)) * 10
-        elif schema_type == "table":
-            schema_cols = set(self._table_value_columns(schema_ent))
-            cand_cols = set(self._table_value_columns(candidate))
-            score += len(schema_cols.intersection(cand_cols)) * 6
-        elif schema_type in ["log/alert", "log"] and (candidate.get("logs") or candidate.get("raw_csv_table")):
-            score += 10
-
-        return score
-
-    def _find_best_entity_match(self, schema_ent: dict, candidates: list[dict], used: set[int]) -> tuple[dict | None, int | None]:
-        best_idx = None
-        best_score = -1
-        for idx, cand in enumerate(candidates):
-            if idx in used:
-                continue
-            score = self._entity_match_score(schema_ent, cand)
-            if score > best_score:
-                best_score = score
-                best_idx = idx
-
-        if best_idx is not None and best_score > 0:
-            return candidates[best_idx], best_idx
-
-        # Fallback: keep same-type order instead of dropping values completely.
-        schema_type = str(schema_ent.get("type", "HMI Object")).strip().lower()
-        for idx, cand in enumerate(candidates):
-            if idx in used:
-                continue
-            cand_type = str(cand.get("type", "HMI Object")).strip().lower()
-            if cand_type == schema_type:
-                return cand, idx
-
-        if best_idx is None:
-            return None, None
-        return candidates[best_idx], best_idx
-
-    def _table_metadata_from_schema(self, schema_ent: dict, extracted_ent: dict | None) -> dict[str, Any]:
-        schema_meta = schema_ent.get("metadata", {}) if isinstance(schema_ent.get("metadata"), dict) else {}
-        value_columns = [str(col).strip() for col in schema_meta.get("value_columns", []) if str(col).strip()]
-
-        if not value_columns:
-            value_columns = self._table_value_columns(schema_ent)
-        if not value_columns and extracted_ent:
-            value_columns = self._table_value_columns(extracted_ent)
-
-        unit_by_col: dict[str, str] = {}
-
-        for sub in schema_ent.get("subentities", []) or []:
-            col = str(sub.get("col", "")).strip()
-            if not col:
-                continue
-            unit_by_col.setdefault(col, str(sub.get("unit", "") or ""))
-
-        extracted_meta = extracted_ent.get("metadata", {}) if extracted_ent and isinstance(extracted_ent.get("metadata"), dict) else {}
-        extracted_cols = [str(col).strip() for col in extracted_meta.get("value_columns", []) if str(col).strip()]
-        extracted_units = [part.strip() for part in str(extracted_meta.get("unit", "") or "").split("|")] if extracted_meta.get("unit") else []
-
-        for idx, col in enumerate(extracted_cols):
-            if col not in unit_by_col:
-                unit_by_col[col] = extracted_units[idx] if idx < len(extracted_units) else ""
-
-        for sub in (extracted_ent.get("subentities", []) or []) if extracted_ent else []:
-            col = str(sub.get("col", "")).strip()
-            if not col:
-                continue
-            unit_by_col.setdefault(col, str(sub.get("unit", "") or ""))
-
-        unit_text = "|".join([unit_by_col.get(col, "") for col in value_columns]) if value_columns else ""
-        type_text = "|".join(["number" for _ in value_columns]) if value_columns else ""
-
-        return {
-            "value_columns": value_columns,
-            "unit": unit_text,
-            "value_type": type_text,
-        }
-
     def _parse_table_csv_to_subentities(self, raw_csv_table: str, metadata: dict[str, Any]) -> list[dict[str, Any]]:
-        import csv
-
         csv_text = str(raw_csv_table or "").strip()
         if not csv_text:
             return []
 
-        rows = list(csv.reader(io.StringIO(csv_text)))
+        try:
+            import io, csv
+            rows = list(csv.reader(io.StringIO(csv_text)))
+        except Exception:
+            return []
+
         if len(rows) < 2:
             return []
 
         header = [str(col).strip() for col in rows[0]]
-        if not header:
-            return []
-
         value_columns = [str(col).strip() for col in metadata.get("value_columns", []) if str(col).strip()]
         metadata_rows = [str(row).strip() for row in metadata.get("rows", []) if str(row).strip()]
 
         first_col_text = str(header[0] if header else "").strip().lower()
-        header_has_row_col = first_col_text in {"row", "rows", "item", "name", "label"}
-
-        header_values = [col for col in header[1:] if col]
-        header_match_count = 0
-        if value_columns and header_values:
-            expected_set = set(value_columns)
-            header_match_count = len([col for col in header_values if col in expected_set])
-        header_looks_like_schema = bool(value_columns) and header_match_count >= max(1, min(2, len(value_columns)))
-
-        use_header = header_has_row_col or header_looks_like_schema
+        use_header = first_col_text in {"row", "rows", "item", "name", "label", "time"} or (bool(value_columns) and any(c in value_columns for c in header))
+        
         data_rows = rows[1:] if use_header else rows
-
         if use_header and not value_columns and len(header) > 1:
             value_columns = header[1:]
 
         if not value_columns:
             width = max((len(row) for row in data_rows), default=len(header))
-            if width <= 1:
-                return []
-            value_columns = [f"col_{idx}" for idx in range(1, width)]
+            value_columns = [f"col_{idx}" for idx in range(1, width)] if width > 1 else ["value"]
 
         unit_parts = [part.strip() for part in str(metadata.get("unit", "") or "").split("|")] if metadata.get("unit") else []
         unit_by_col = {col: (unit_parts[idx] if idx < len(unit_parts) else "") for idx, col in enumerate(value_columns)}
+        col_idx_map = {col: idx for idx, col in enumerate(header)} if use_header else {}
 
-        col_idx = {col: idx for idx, col in enumerate(header)} if use_header else {}
         subentities = []
         for row_idx, row in enumerate(data_rows):
             row_name = str(row[0]).strip() if row else ""
@@ -1439,308 +1230,66 @@ class PipelineServiceV2(pipeline_service.PipelineService):
                 row_name = "Unknown"
 
             for col_pos, col in enumerate(value_columns):
-                if use_header:
-                    idx = col_idx.get(col)
-                    if idx is None:
-                        continue
-                else:
-                    idx = col_pos + 1
-                if idx >= len(row):
+                idx = col_idx_map.get(col) if use_header else col_pos + 1
+                if idx is None or idx >= len(row):
                     continue
-                value_raw = str(row[idx]).strip()
-                if value_raw == "":
+                
+                val_raw = str(row[idx]).strip()
+                if val_raw == "":
                     continue
-
-                value_number, normalized_raw = self._coerce_numeric_pair(value_raw)
-
+                
+                val_num, norm_raw = self._coerce_numeric_pair(val_raw)
                 subentities.append({
                     "col": col,
                     "row": row_name,
-                    "value_raw": normalized_raw,
-                    "value_number": value_number,
+                    "value_raw": norm_raw,
+                    "value_number": val_num,
                     "unit": unit_by_col.get(col, ""),
                     "value_type": "number",
                 })
-
         return subentities
 
-    def _build_table_csv_from_subentities(self, subentities: list[dict], value_columns: list[str]) -> str:
-        import csv
-
-        if not subentities:
+    def _convert_entities_to_csv(self, items: list[dict], columns: list[str]) -> str:
+        """Unified helper to build CSV from either table segments (subentities) or log segments (list of dicts)."""
+        if not items:
             return ""
-
-        cols = [str(col).strip() for col in value_columns if str(col).strip()]
-        if not cols:
-            cols = []
-            for sub in subentities:
-                col = str(sub.get("col", "")).strip()
-                if col and col not in cols:
-                    cols.append(col)
-        if not cols:
-            return ""
-
-        row_order = []
-        value_map: dict[str, dict[str, str]] = {}
-        for sub in subentities:
-            row_name = str(sub.get("row", "") or "Unknown").strip() or "Unknown"
-            col = str(sub.get("col", "")).strip()
-            if not col:
-                continue
-            if row_name not in value_map:
-                value_map[row_name] = {}
-                row_order.append(row_name)
-            raw_val = sub.get("value_raw")
-            if raw_val is None or raw_val == "":
-                raw_val = sub.get("value")
-            if raw_val is None and sub.get("value_number") is not None:
-                raw_val = str(sub.get("value_number"))
-            value_map[row_name][col] = str(raw_val or "")
-
+        
+        import io, csv
         out = io.StringIO()
         writer = csv.writer(out)
-        writer.writerow(["row"] + cols)
-        for row_name in row_order:
-            writer.writerow([row_name] + [value_map.get(row_name, {}).get(col, "") for col in cols])
+        
+        # Check if items are subentities (have 'row' and 'col') or log-like dicts
+        is_subentities = all(isinstance(x, dict) and "row" in x and "col" in x for x in items[:3] if x)
+        
+        if is_subentities:
+            row_order = []
+            value_map: dict[str, dict[str, str]] = {}
+            cols = [str(c).strip() for c in columns if str(c).strip()]
+            if not cols:
+                cols = list(dict.fromkeys(str(x.get("col", "")).strip() for x in items if str(x.get("col", "")).strip()))
+            
+            for sub in items:
+                r = str(sub.get("row", "Unknown")).strip() or "Unknown"
+                c = str(sub.get("col", "")).strip()
+                if not c: continue
+                if r not in value_map:
+                    value_map[r] = {}
+                    row_order.append(r)
+                val = sub.get("value_raw", sub.get("value"))
+                if val is None: val = sub.get("value_number")
+                value_map[r][c] = str(val if val is not None else "")
+                
+            writer.writerow(["row"] + cols)
+            for r in row_order:
+                writer.writerow([r] + [value_map[r].get(c, "") for c in cols])
+        else:
+            # Assume log entries or flat dicts
+            header = columns if columns else list(items[0].keys())
+            writer.writerow(header)
+            for item in items:
+                writer.writerow([str(item.get(k, "")).strip() for k in header])
+                
         return out.getvalue().strip()
-
-    def _build_log_csv(self, logs: list[dict]) -> str:
-        import csv
-
-        if not logs:
-            return ""
-        out = io.StringIO()
-        writer = csv.writer(out)
-        writer.writerow(["time", "message"])
-        for lg in logs:
-            message_text = lg.get("message")
-            if message_text is None or message_text == "":
-                name_text = str(lg.get("name", "") or "")
-                desc_text = str(lg.get("desc", lg.get("msg", "")) or "")
-                if name_text and desc_text:
-                    message_text = f"{name_text}: {desc_text}"
-                else:
-                    message_text = name_text or desc_text
-            writer.writerow([
-                str(lg.get("time", "") or ""),
-                str(message_text or ""),
-            ])
-        return out.getvalue().strip()
-
-    def _normalize_hmi_indicators(self, schema_ent: dict, extracted_ent: dict | None) -> list[dict]:
-        indicators_schema = schema_ent.get("indicators", []) or []
-        extracted_indicators = extracted_ent.get("indicators", []) if extracted_ent else []
-        expected_labels = [
-            str(ind.get("label") or ind.get("metric") or "").strip()
-            for ind in indicators_schema
-            if str(ind.get("label") or ind.get("metric") or "").strip()
-        ]
-        return self._normalize_indicator_values(extracted_indicators or [], expected_labels=expected_labels)
-
-    def _normalize_log_entries(self, matched: dict | None) -> list[dict[str, str]]:
-        logs = []
-        if matched:
-            logs = list(matched.get("logs", []) or [])
-
-        normalized = []
-        for lg in logs:
-            time_text = str(lg.get("time", "") or "")
-            message_text = lg.get("message")
-            if message_text is None or message_text == "":
-                name_text = str(lg.get("name", "") or "")
-                desc_text = str(lg.get("desc", lg.get("msg", "")) or "")
-                if name_text and desc_text:
-                    message_text = f"{name_text}: {desc_text}"
-                else:
-                    message_text = name_text or desc_text
-            normalized.append({
-                "time": time_text,
-                "message": str(message_text or ""),
-            })
-
-        raw_csv = str(matched.get("raw_csv_table") or "").strip() if matched else ""
-        if not normalized and raw_csv:
-            import csv
-            rows = list(csv.reader(io.StringIO(raw_csv)))
-            if rows:
-                header = [str(col).strip().lower() for col in rows[0]]
-                time_idx = 0
-                msg_idx = 1 if len(header) > 1 else 0
-                if "time" in header:
-                    time_idx = header.index("time")
-                if "message" in header:
-                    msg_idx = header.index("message")
-                elif "desc" in header:
-                    msg_idx = header.index("desc")
-                elif "name" in header:
-                    msg_idx = header.index("name")
-
-                for row in rows[1:]:
-                    time_text = str(row[time_idx]).strip() if time_idx < len(row) else ""
-                    msg_text = str(row[msg_idx]).strip() if msg_idx < len(row) else ""
-                    normalized.append({"time": time_text, "message": msg_text})
-
-        return normalized
-
-    def _normalize_table_entity(self, schema_ent: dict, extracted_ent: dict | None) -> dict[str, Any]:
-        metadata = self._table_metadata_from_schema(schema_ent, extracted_ent)
-        value_columns = [str(col).strip() for col in metadata.get("value_columns", []) if str(col).strip()]
-        unit_parts = [part.strip() for part in str(metadata.get("unit", "") or "").split("|")] if metadata.get("unit") else []
-        unit_by_col = {col: (unit_parts[idx] if idx < len(unit_parts) else "") for idx, col in enumerate(value_columns)}
-
-        raw_csv_table = ""
-        subentities = []
-
-        if extracted_ent:
-            raw_csv_table = str(extracted_ent.get("raw_csv_table") or extracted_ent.get("csv_table") or "").strip()
-            subentities = list(extracted_ent.get("subentities", []) or [])
-
-        if not subentities and raw_csv_table:
-            subentities = self._parse_table_csv_to_subentities(raw_csv_table, metadata)
-
-        if subentities:
-            normalized_subentities = []
-            for sub in subentities:
-                col = str(sub.get("col", "")).strip()
-                row = str(sub.get("row", "")).strip() or "Unknown"
-                value_raw = sub.get("value_raw")
-                if value_raw is None or value_raw == "":
-                    value_raw = sub.get("value")
-                value_number, normalized_raw = self._coerce_numeric_pair(value_raw, sub.get("value_number"))
-
-                normalized_subentities.append({
-                    "col": col,
-                    "row": row,
-                    "value_raw": normalized_raw,
-                    "value_number": value_number,
-                    "unit": sub.get("unit", "") or unit_by_col.get(col, ""),
-                    "value_type": "number",
-                })
-            subentities = normalized_subentities
-
-        subentities = self._normalize_table_subentities(subentities)
-
-        metadata["value_type"] = "|".join(["number" for _ in value_columns]) if value_columns else ""
-
-        if not raw_csv_table and subentities:
-            raw_csv_table = self._build_table_csv_from_subentities(subentities, metadata.get("value_columns", []))
-
-        return {
-            "raw_csv_table": raw_csv_table,
-            "metadata": metadata,
-            "subentities": subentities,
-        }
-
-    def _build_snapshot_entities_values(self, schema: list, extracted_entities: list) -> list:
-        if not schema:
-            return extracted_entities
-
-        candidates = list(extracted_entities or [])
-        used_indices: set[int] = set()
-        output = []
-
-        for schema_ent in schema:
-            matched, matched_idx = self._find_best_entity_match(schema_ent, candidates, used_indices)
-            if matched_idx is not None:
-                used_indices.add(matched_idx)
-
-            ent_type = str(schema_ent.get("type", "HMI Object")).strip()
-            ent_type_lower = ent_type.lower()
-            base = {
-                "id": schema_ent.get("id"),
-                "main_entity_name": schema_ent.get("main_entity_name", ""),
-                "type": ent_type,
-                "region": schema_ent.get("region", "center"),
-            }
-
-            if ent_type_lower == "table":
-                table_payload = self._normalize_table_entity(schema_ent, matched)
-                base.update(table_payload)
-            elif ent_type_lower in ["log/alert", "log"]:
-                logs = self._normalize_log_entries(matched)
-                raw_csv = str(matched.get("raw_csv_table") or "").strip() if matched else ""
-                if not raw_csv and logs:
-                    raw_csv = self._build_log_csv(logs)
-                base["logs"] = logs
-                if raw_csv:
-                    base["raw_csv_table"] = raw_csv
-            else:
-                base["indicators"] = self._normalize_hmi_indicators(schema_ent, matched)
-
-            output.append(base)
-
-        return output
-
-    def _post_process_tables(self, entities: list) -> list:
-        for ent in entities:
-            if str(ent.get("type", "")).lower() == "table" and ent.get("subentities"):
-                continue
-            if str(ent.get("type", "")).lower() == "table" and "markdown" in ent:
-                md_text = ent.get("markdown", "").strip()
-                metadata = ent.get("metadata", {})
-                sub_list = []
-                lines = md_text.split("\n")
-                if len(lines) >= 3:
-                    # Extract headers
-                    headers = [h.strip() for h in lines[0].split("|")[1:-1]]
-                    
-                    row_name_col_indices = []
-                    value_col_indices = []
-                    
-                    val_cols = metadata.get("value_columns", [])
-                    
-                    for i, h in enumerate(headers):
-                        if h.lower() in ["no", "no.", "index"]:
-                            continue
-                        if h in val_cols or value_col_indices:
-                            value_col_indices.append(i)
-                        else:
-                            row_name_col_indices.append(i)
-                            
-                    if not row_name_col_indices and headers:
-                       row_name_col_indices = [0]
-                       if 0 in value_col_indices: value_col_indices.remove(0)
-                    if not value_col_indices and len(headers) > 1:
-                       value_col_indices = list(range(1, len(headers)))
-
-                    for row_line in lines[2:]:
-                        cells = [c.strip() for c in row_line.split("|")[1:-1]]
-                        if not cells: continue
-                        
-                        row_name_parts = []
-                        for idx in row_name_col_indices:
-                            if idx < len(cells):
-                                val = cells[idx]
-                                # Fallback to ignore digits if it's the very first column and likely an STT missed by header
-                                if idx == 0 and val.isdigit():
-                                    continue
-                                if val and val != "-":
-                                    row_name_parts.append(val)
-                        row_name = " ".join(row_name_parts) if row_name_parts else "Unknown"
-
-                        for col_idx in value_col_indices:
-                            if col_idx < len(cells):
-                                cell_value = cells[col_idx]
-                                col_name = headers[col_idx]
-                                val_num = None
-                                try:
-                                    import re
-                                    # Remove all non-numeric chars except digits, period, minus
-                                    num_str = re.sub(r'[^\d\.\-]', '', cell_value)
-                                    if num_str and num_str != "-":
-                                        val_num = float(num_str)
-                                except:
-                                    pass
-                                sub_list.append({
-                                    "col": col_name,
-                                    "row": row_name,
-                                    "value_raw": cell_value,
-                                    "value_number": val_num,
-                                    "unit": metadata.get("unit", ""),
-                                    "value_type": metadata.get("value_type", "number" if val_num is not None else "text")
-                                })
-                ent["subentities"] = self._normalize_table_subentities(sub_list)
-        return entities
 
     def _update_schema(self, db: Database, group: dict, entities: list) -> list:
         new_schema = []

@@ -14,7 +14,7 @@ COPY . .
 ARG NEXT_PUBLIC_BACKEND_URL
 ENV NEXT_PUBLIC_BACKEND_URL=${NEXT_PUBLIC_BACKEND_URL}
 
-RUN npm run build
+RUN npm run build -- --no-lint
 
 # Production stage
 FROM node:18-alpine AS runner

@@ -107,6 +107,9 @@ def _load_runtime_llm_settings() -> dict[str, str]:
         "markdown_to_json_prompt": prompts.prompt_v1.MARKDOWN_TO_JSON_PROMPT,
         "extract_from_schema_prompt": prompts.prompt_v1.EXTRACT_FROM_SCHEMA_PROMPT,
         "v2_extract_base_prompt": getattr(prompts.prompt_v2, "V2_EXTRACT_BASE_PROMPT", ""),
+        "v2_scada_prompt": getattr(prompts.prompt_v2, "V2_SCADA_OBJECT_PROMPT", ""),
+        "v2_fixed_table_prompt": getattr(prompts.prompt_v2, "V2_FIXED_TABLE_PROMPT", ""),
+        "v2_log_table_prompt": getattr(prompts.prompt_v2, "V2_LOG_TABLE_PROMPT", ""),
         "v2_merge_prompt": getattr(prompts.prompt_v2, "V2_MERGE_PROMPT", ""),
     }
     doc = _load_runtime_settings_file()
@@ -504,4 +507,73 @@ def call_llm_v2_extract(
     except Exception as exc:
         logger.error("v2 single-pass extract failed: %s", exc)
         return {"entities": [], "_parse_error": str(exc)}
+
+def call_llm_segment(
+    image_bytes: bytes,
+    seg_type: str,
+    columns: list[str] | None = None,
+    rows: list[str] | None = None,
+) -> dict[str, Any]:
+    settings = _load_runtime_llm_settings()
+    base_url = _normalize_openai_base_url(settings.get("llm_base_api", ""))
+    if not base_url:
+        return {}
+
+    client = OpenAI(
+        base_url=base_url,
+        api_key=settings["api_key"] or "no-key"
+    )
+
+    image_b64 = base64.b64encode(image_bytes).decode("utf-8")
+    
+    prompt_key = "v2_scada_prompt"
+    if seg_type == "fixed table":
+        prompt_key = "v2_fixed_table_prompt"
+    elif seg_type == "log tables":
+        prompt_key = "v2_log_table_prompt"
+    
+    system_prompt = settings.get(prompt_key, "")
+    if prompt_key == "v2_scada_prompt":
+        indicators_list = columns or []
+        csv_rows = "\n".join([f"{label}," for label in indicators_list])
+        system_prompt = system_prompt.format(
+            indicators=", ".join(indicators_list),
+            indicators_csv_rows=csv_rows
+        )
+    elif prompt_key == "v2_fixed_table_prompt":
+        col_header = ",".join(columns or [])
+        row_templates = "\n".join([f"{row_name}," for row_name in (rows or [])])
+        system_prompt = system_prompt.format(
+            columns=", ".join(columns or []),
+            rows=", ".join(rows or []),
+            columns_header=col_header,
+            rows_csv_template=row_templates
+        )
+
+    try:
+        response = client.chat.completions.create(
+            model=settings["llm_model"],
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{image_b64}"}},
+                    ],
+                },
+            ],
+            temperature=0,
+            timeout=300,
+            max_tokens=4096,
+        )
+        content = response.choices[0].message.content.strip()
+        # Remove markdown code blocks if the LLM hallucinated them
+        if content.startswith("```"):
+            content = re.sub(r"```(csv)?\n?", "", content)
+            content = re.sub(r"\n?```", "", content)
+        
+        return {"raw_csv_table": content.strip()}
+    except Exception as exc:
+        logger.error("Segment LLM extraction failed (%s): %s", seg_type, exc)
+        return {"_parse_error": str(exc)}
 

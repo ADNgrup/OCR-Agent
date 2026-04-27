@@ -69,8 +69,60 @@ STRICT RULES:
 9. If schema is provided, do not rename or drop schema entities.
 """
 
+V2_SCADA_OBJECT_PROMPT = """
+You are an expert HMI data extractor.
+Input: Image of a specific SCADA area containing indicators.
+Indicators to extract: {indicators}
+
+Task: Fill in the values for the following CSV structure.
+Format:
+label,value
+{indicators_csv_rows}
+
+Rules:
+1. Return ONLY the CSV data starting with "label,value".
+2. Convert ON/OFF, RUN/STOP, OPEN/CLOSE, TRUE/FALSE to 1/0.
+3. Keep results faithful to the image.
+4. If a value is not visible or clear, leave it as 0.
+5. NO markdown formatting, NO JSON, NO explanation.
+"""
+
+V2_FIXED_TABLE_PROMPT = """
+You are an expert HMI data extractor.
+Input: Image of a fixed data table.
+Columns: {columns}
+Rows: {rows}
+
+Task: Fill in the cell values for the following CSV structure.
+Format:
+, {columns_header}
+{rows_csv_template}
+
+Rules:
+1. Return ONLY the CSV data. The first column corresponds to the Row names.
+2. All data cells (except the first row/column) must be numeric. Convert states to 1/0.
+3. Keep results faithful to the image.
+4. If a cell is empty or unclear, use 0.
+5. NO markdown formatting, NO JSON, NO explanation.
+"""
+
+V2_LOG_TABLE_PROMPT = """
+You are an expert HMI data extractor.
+Input: Image of a log or alarm table.
+
+Task: Extract all visible log entries into a CSV.
+Format:
+time,message
+[timestamp],[log content]
+
+Rules:
+1. Return ONLY the CSV data starting with "time,message".
+2. Normalize all data into two columns: 'time' and 'message'.
+3. NO markdown formatting, NO JSON, NO explanation.
+"""
+
 V2_MERGE_PROMPT = """
-Deprecated. Kept for backward compatibility. The V2 pipeline now uses only V2_EXTRACT_BASE_PROMPT.
+Deprecated. Kept for backward compatibility. The V2 pipeline now uses specialized segment prompts.
 """
 
 
